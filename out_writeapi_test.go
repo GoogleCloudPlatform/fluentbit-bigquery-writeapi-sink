@@ -291,6 +291,405 @@ func TestFLBPluginInitExactlyOnce(t *testing.T) {
 
 }
 
+type StreamChecks struct {
+	calledGetContext int
+	createDecoder    int
+	gotRecord        int
+	appendRows       int
+	getResultsCount  int
+	checkReady       int
+}
+
+// Interface to be able to mock functions
+type MockManagedStream struct {
+	managedstream  *managedwriter.ManagedStream
+	AppendRowsFunc func(ctx context.Context, data [][]byte, opts ...managedwriter.AppendOption) (*managedwriter.AppendResult, error)
+	CloseFunc      func() error
+	FinalizeFunc   func(ctx context.Context, opts ...gax.CallOption) (int64, error)
+	FlushRowsFunc  func(ctx context.Context, offset int64, opts ...gax.CallOption) (int64, error)
+	StreamNameFunc func() string
+}
+
+func (m *MockManagedStream) AppendRows(ctx context.Context, data [][]byte, opts ...managedwriter.AppendOption) (*managedwriter.AppendResult, error) {
+	return m.AppendRowsFunc(ctx, data, opts...)
+}
+
+func (m *MockManagedStream) Finalize(ctx context.Context, opts ...gax.CallOption) (int64, error) {
+	return m.FinalizeFunc(ctx, opts...)
+}
+
+func (m *MockManagedStream) FlushRows(ctx context.Context, offset int64, opts ...gax.CallOption) (int64, error) {
+	return m.FlushRowsFunc(ctx, offset, opts...)
+}
+
+func (m *MockManagedStream) StreamName() string {
+	return m.StreamNameFunc()
+}
+
+func (m *MockManagedStream) Close() error {
+	return m.managedstream.Close()
+}
+
+func TestFLBPluginFlushCtx(t *testing.T) {
+	checks := new(StreamChecks)
+	var setID int
+
+	testTableSchema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "Time", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "Text", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+
+	mockClient := &MockManagedWriterClient{
+		NewManagedStreamFunc: func(ctx context.Context, opts ...managedwriter.WriterOption) (*managedwriter.ManagedStream, error) {
+			return nil, nil
+
+		},
+		GetWriteStreamFunc: func(ctx context.Context, req *storagepb.GetWriteStreamRequest, opts ...gax.CallOption) (*storagepb.WriteStream, error) {
+			return &storagepb.WriteStream{
+				Name:        "mockstream",
+				TableSchema: testTableSchema,
+			}, nil
+		},
+	}
+
+	originalFunc := getClient
+	getClient = func(ctx context.Context, projectID string) (ManagedWriterClient, error) {
+		return mockClient, nil
+	}
+	defer func() { getClient = originalFunc }()
+
+	testGetDescrip := func() (protoreflect.MessageDescriptor, *descriptorpb.DescriptorProto) {
+		table_schema := testTableSchema
+		descriptor, _ := adapt.StorageSchemaToProto2Descriptor(table_schema, "root")
+		messageDescriptor, _ := descriptor.(protoreflect.MessageDescriptor)
+		dp, _ := adapt.NormalizeDescriptor(messageDescriptor)
+
+		return messageDescriptor, dp
+	}
+
+	md, _ := testGetDescrip()
+	mockMS := &MockManagedStream{
+		AppendRowsFunc: func(ctx context.Context, data [][]byte, opts ...managedwriter.AppendOption) (*managedwriter.AppendResult, error) {
+			checks.appendRows++
+
+			var combinedData []byte
+			for _, tempData := range data {
+				combinedData = append(combinedData, tempData...)
+			}
+
+			message := dynamicpb.NewMessage(md)
+			err := proto.Unmarshal(combinedData, message)
+			if err != nil {
+				return nil, fmt.Errorf("Failed to unmarshal")
+			}
+
+			textField := message.Get(md.Fields().ByJSONName("Text"))
+			timeField := message.Get(md.Fields().ByJSONName("Time"))
+
+			assert.Equal(t, "FOO", textField.String())
+			assert.Equal(t, "000", timeField.String())
+
+			return nil, nil
+		},
+		FinalizeFunc: func(ctx context.Context, opts ...gax.CallOption) (int64, error) {
+			return 0, nil
+		},
+		FlushRowsFunc: func(ctx context.Context, offset int64, opts ...gax.CallOption) (int64, error) {
+			return 0, nil
+		},
+		StreamNameFunc: func() string {
+			return ""
+		},
+	}
+
+	origFunc := getWriter
+	getWriter = func(client ManagedWriterClient, ctx context.Context, projectID string, opts ...managedwriter.WriterOption) (MWManagedStream, error) {
+		return mockMS, nil
+	}
+	defer func() { getWriter = origFunc }()
+
+	patch1 := monkey.Patch(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
+		return ""
+	})
+	defer patch1.Unpatch()
+
+	patchSetContext := monkey.Patch(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
+		setID = ctx.(int)
+	})
+	defer patchSetContext.Unpatch()
+
+	initRes := FLBPluginInit(nil)
+
+	orgFunc := getFLBPluginContext
+	getFLBPluginContext = func(ctx unsafe.Pointer) int {
+		checks.calledGetContext++
+		return setID
+	}
+	defer func() { getFLBPluginContext = orgFunc }()
+
+	origReadyFunc := isReady
+	isReady = func(queueHead *managedwriter.AppendResult) bool {
+		// Response is always ready for test
+		return true
+	}
+	defer func() { isReady = origReadyFunc }()
+
+	origResultFunc := pluginGetResult
+	pluginGetResult = func(queueHead *managedwriter.AppendResult, ctx context.Context) (int64, error) {
+		checks.getResultsCount++
+		return -1, nil
+	}
+	defer func() { pluginGetResult = origResultFunc }()
+
+	patchDecoder := monkey.Patch(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
+		checks.createDecoder++
+		return nil
+	})
+	defer patchDecoder.Unpatch()
+
+	var rowSent int = 0
+	var rowCount int = 5
+	patchRecord := monkey.Patch(output.GetRecord, func(dec *output.FLBDecoder) (ret int, ts interface{}, rec map[interface{}]interface{}) {
+		checks.gotRecord++
+		dummyRecord := make(map[interface{}]interface{})
+		if rowSent < rowCount {
+			rowSent++
+			// Represents "FOO" in bytes as the data for the Text field
+			dummyRecord["Text"] = []byte{70, 79, 79}
+			// Represents "000" in bytes as the data for the Time field
+			dummyRecord["Time"] = []byte{48, 48, 48}
+			return 0, nil, dummyRecord
+		}
+		// Reset to prepare for next call to Flush
+		rowSent = 0
+		return 1, nil, nil
+	})
+	defer patchRecord.Unpatch()
+
+	// Converts id (int) to type unsafe.Pointer to be used as the ctx
+	uintptrValue := uintptr(setID)
+	pointerValue := unsafe.Pointer(uintptrValue)
+
+	// Calls FlushCtx with this ID
+	result := FLBPluginFlushCtx(pointerValue, nil, 0, nil)
+	result = FLBPluginFlushCtx(pointerValue, nil, 0, nil)
+
+	// If we change number of rows, the number of times GetRecord is called changes. This finds the expected
+	// Number without having to manually change it. Each time flush is called, GetRecord is called for the
+	// Number of rows plus once to break the loop. Since flush is called twice, we multiply this by 2
+	expectGotRecord := (rowCount + 1) * 2
+
+	assert.Equal(t, output.FLB_OK, initRes)
+	assert.Equal(t, output.FLB_OK, result)
+	assert.Equal(t, 2, checks.appendRows)
+	assert.Equal(t, 2, checks.calledGetContext)
+	assert.Equal(t, 1, checks.getResultsCount)
+	assert.Equal(t, 2, checks.createDecoder)
+	assert.Equal(t, expectGotRecord, checks.gotRecord)
+}
+
+type dynamicScaleChecks struct {
+	buildStreamCalled int
+}
+
+func TestFLBPluginFlushCtxDynamicScaling(t *testing.T) {
+	checks := new(dynamicScaleChecks)
+	var setID int
+
+	// Sets schema for table
+	testTableSchema := &storagepb.TableSchema{
+		Fields: []*storagepb.TableFieldSchema{
+			{Name: "Time", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+			{Name: "Text", Type: storagepb.TableFieldSchema_STRING, Mode: storagepb.TableFieldSchema_NULLABLE},
+		},
+	}
+
+	// Mock Client
+	mockClient := &MockManagedWriterClient{
+		NewManagedStreamFunc: func(ctx context.Context, opts ...managedwriter.WriterOption) (*managedwriter.ManagedStream, error) {
+			return nil, nil
+
+		},
+		GetWriteStreamFunc: func(ctx context.Context, req *storagepb.GetWriteStreamRequest, opts ...gax.CallOption) (*storagepb.WriteStream, error) {
+			return &storagepb.WriteStream{
+				Name:        "mockstream",
+				TableSchema: testTableSchema,
+			}, nil
+		},
+	}
+
+	// Patches config key to set values
+	patch1 := monkey.Patch(output.FLBPluginConfigKey, func(plugin unsafe.Pointer, key string) string {
+		switch key {
+		case "Max_Chunk_Size":
+			return "0"
+		case "Max_Queue_Requests":
+			return "0"
+		case "Exactly_Once":
+			return "False"
+		default:
+			return ""
+		}
+	})
+	defer patch1.Unpatch()
+
+	// Returns mock client instead of an actual one
+	originalFunc := getClient
+	getClient = func(ctx context.Context, projectID string) (ManagedWriterClient, error) {
+		return mockClient, nil
+	}
+	defer func() { getClient = originalFunc }()
+
+	// Returns mock message descriptor
+	testGetDescrip := func() (protoreflect.MessageDescriptor, *descriptorpb.DescriptorProto) {
+		table_schema := testTableSchema
+		descriptor, _ := adapt.StorageSchemaToProto2Descriptor(table_schema, "root")
+		messageDescriptor, _ := descriptor.(protoreflect.MessageDescriptor)
+		dp, _ := adapt.NormalizeDescriptor(messageDescriptor)
+
+		return messageDescriptor, dp
+	}
+
+	// Mock managedstream
+	md, _ := testGetDescrip()
+	mockMS := &MockManagedStream{
+		AppendRowsFunc: func(ctx context.Context, data [][]byte, opts ...managedwriter.AppendOption) (*managedwriter.AppendResult, error) {
+			var combinedData []byte
+			for _, tempData := range data {
+				combinedData = append(combinedData, tempData...)
+			}
+
+			message := dynamicpb.NewMessage(md)
+			err := proto.Unmarshal(combinedData, message)
+			if err != nil {
+				return nil, fmt.Errorf("Failed to unmarshal")
+			}
+
+			textField := message.Get(md.Fields().ByJSONName("Text"))
+			timeField := message.Get(md.Fields().ByJSONName("Time"))
+
+			assert.Equal(t, "FOO", textField.String())
+			assert.Equal(t, "000", timeField.String())
+
+			return nil, nil
+		},
+		FinalizeFunc: func(ctx context.Context, opts ...gax.CallOption) (int64, error) {
+			return 0, nil
+		},
+		FlushRowsFunc: func(ctx context.Context, offset int64, opts ...gax.CallOption) (int64, error) {
+			return 0, nil
+		},
+		StreamNameFunc: func() string {
+			return ""
+		},
+	}
+
+	// Returns mock managedstream
+	origFunc := getWriter
+	getWriter = func(client ManagedWriterClient, ctx context.Context, projectID string, opts ...managedwriter.WriterOption) (MWManagedStream, error) {
+		return mockMS, nil
+	}
+	defer func() { getWriter = origFunc }()
+
+	patchSetContext := monkey.Patch(output.FLBPluginSetContext, func(plugin unsafe.Pointer, ctx interface{}) {
+		setID = ctx.(int)
+	})
+	defer patchSetContext.Unpatch()
+
+	patchSetThreshold := setThreshold
+	setThreshold = func(queueSize int) int {
+		return 4
+	}
+	defer func() { setThreshold = patchSetThreshold }()
+
+	// Calls init
+	initRes := FLBPluginInit(nil)
+
+	// Begin mocking for flush call
+	orgFunc := getFLBPluginContext
+	getFLBPluginContext = func(ctx unsafe.Pointer) int {
+		return setID
+	}
+	defer func() { getFLBPluginContext = orgFunc }()
+
+	origReadyFunc := isReady
+	isReady = func(queueHead *managedwriter.AppendResult) bool {
+		// Response is not ready for test, preserving queue
+		return false
+	}
+	defer func() { isReady = origReadyFunc }()
+
+	// Returns result of append rows
+	origResultFunc := pluginGetResult
+	pluginGetResult = func(queueHead *managedwriter.AppendResult, ctx context.Context) (int64, error) {
+		return -1, nil
+	}
+	defer func() { pluginGetResult = origResultFunc }()
+
+	patchDecoder := monkey.Patch(output.NewDecoder, func(data unsafe.Pointer, length int) *output.FLBDecoder {
+		return nil
+	})
+	defer patchDecoder.Unpatch()
+
+	// Sending rows and data
+	var rowSent int = 0
+	var rowCount int = 5
+	patchRecord := monkey.Patch(output.GetRecord, func(dec *output.FLBDecoder) (ret int, ts interface{}, rec map[interface{}]interface{}) {
+		dummyRecord := make(map[interface{}]interface{})
+		if rowSent < rowCount {
+			rowSent++
+			// Represents "FOO" in bytes as the data for the Text field
+			dummyRecord["Text"] = []byte{70, 79, 79}
+			// Represents "000" in bytes as the data for the Time field
+			dummyRecord["Time"] = []byte{48, 48, 48}
+			return 0, nil, dummyRecord
+		}
+		// Reset to prepare for next call to Flush
+		rowSent = 0
+		return 1, nil, nil
+	})
+	defer patchRecord.Unpatch()
+
+	// Creates new stream with a mock buildStream function to count the number of times we scale up
+	patchBuild := monkey.Patch(buildStream, func(ctx context.Context, config **outputConfig, streamIndex int) error {
+		checks.buildStreamCalled++
+		currManagedStream, err := getWriter((*config).client, ctx, (*config).currProjectID,
+			managedwriter.WithType((*config).streamType),
+			managedwriter.WithDestinationTable((*config).tableRef),
+			// Use the descriptor proto when creating the new managed stream
+			managedwriter.WithSchemaDescriptor((*config).schemaDesc),
+			managedwriter.EnableWriteRetries((*config).enableRetry),
+			managedwriter.WithMaxInflightBytes((*config).maxQueueBytes),
+			managedwriter.WithMaxInflightRequests((*config).maxQueueRequests),
+		)
+
+		streamSlice := *(*config).managedStreamSlice
+
+		if err == nil {
+			(streamSlice)[streamIndex].managedstream = currManagedStream
+		}
+		return nil
+	})
+	defer patchBuild.Unpatch()
+
+	// Converts id (int) to type unsafe.Pointer to be used as the ctx
+	uintptrValue := uintptr(setID)
+	pointerValue := unsafe.Pointer(uintptrValue)
+
+	// Calls FlushCtx with this ID
+	result := FLBPluginFlushCtx(pointerValue, nil, 0, nil)
+	// New stream should be built here
+	result = FLBPluginFlushCtx(pointerValue, nil, 0, nil)
+	// New stream should be built here
+	result = FLBPluginFlushCtx(pointerValue, nil, 0, nil)
+
+	assert.Equal(t, output.FLB_OK, initRes)
+	assert.Equal(t, output.FLB_OK, result)
+	assert.Equal(t, 2, checks.buildStreamCalled)
+}
+
 func TestFLBPluginFlushCtxExactlyOnce(t *testing.T) {
 	checks := new(StreamChecks)
 	var setID int
