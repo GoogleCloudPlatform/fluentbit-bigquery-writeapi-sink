@@ -39,11 +39,47 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 )
 
+// Struct for each stream - can be multiple per output
+type streamConfig struct {
+	managedstream MWManagedStream
+	appendResults *[]*managedwriter.AppendResult
+	offsetCounter int64
+}
+
+// Struct for each instance - one per output
+type outputConfig struct {
+	messageDescriptor     protoreflect.MessageDescriptor
+	streamType            managedwriter.StreamType
+	currProjectID         string
+	tableRef              string
+	schemaDesc            *descriptorpb.DescriptorProto
+	enableRetry           bool
+	maxQueueBytes         int
+	maxQueueRequests      int
+	managedStreamSlice    *[]*streamConfig
+	client                ManagedWriterClient
+	maxChunkSize          int
+	mutex                 sync.Mutex
+	exactlyOnce           bool
+	requestCountThreshold int
+	numRetries            int
+}
+
+var (
+	ms_ctx    = context.Background()
+	configMap = make(map[int]*outputConfig)
+	configID  = 0
+)
+
 const (
 	chunkSizeLimit             = 9 * 1024 * 1024
 	queueRequestDefault        = 1000
 	queueByteDefault           = 100 * 1024 * 1024
 	exactlyOnceDefault         = false
+	queueRequestScalingPercent = 0.8
+	numRetriesDefault          = 4
+	maxNumStreamsPerInstance   = 10
+	minQueueRequests           = 10
 	dateTimeDefault            = true
 )
 
@@ -165,6 +201,19 @@ func parseMap(mapInterface map[interface{}]interface{}) map[string]interface{} {
 	return m
 }
 
+var isReady = func(result *managedwriter.AppendResult) bool {
+	select {
+	case <-result.Ready():
+		return true
+	default:
+		return false
+	}
+}
+
+var pluginGetResult = func(result *managedwriter.AppendResult, ctx context.Context) (int64, error) {
+	return result.GetResult(ctx)
+}
+
 // This function is used for asynchronous WriteAPI response checking
 // It takes in the relevant queue of responses as well as boolean that indicates whether we should block the AppendRows function
 // And wait for the next ready response from WriteAPI
@@ -189,6 +238,16 @@ func checkResponses(curr_ctx context.Context, streamSlice *[]*streamConfig, wait
 
 	}
 	return len(*currQueuePointer)
+}
+
+// This function checks the responses for all streams in the slice for each instance
+func checkAllStreamResponses(ctx context.Context, streamSlice **[]*streamConfig, waitForResponse bool, currMutex *sync.Mutex, exactlyOnceConf bool, id int) {
+	(*currMutex).Lock()
+	defer (*currMutex).Unlock()
+	sliceLen := len(**streamSlice)
+	for i := 0; i < sliceLen; i++ {
+		checkResponses(ctx, *streamSlice, waitForResponse, exactlyOnceConf, id, i)
+	}
 }
 
 // This function gets the value of various configuration fields and returns an error if the field could not be parsed
@@ -229,6 +288,12 @@ func buildStream(ctx context.Context, config **outputConfig, streamIndex int) er
 		managedwriter.WithTraceID("FluentBit"),
 	)
 
+	streamSlice := *(*config).managedStreamSlice
+
+	if err == nil {
+		(streamSlice)[streamIndex].managedstream = currManagedStream
+	}
+	return err
 }
 
 // This function returns whether or not the response indicates an invalid stream
@@ -299,11 +364,14 @@ func sendRequestRetries(ctx context.Context, data [][]byte, config **outputConfi
 func sendRequestDefault(ctx context.Context, data [][]byte, config **outputConfig, streamIndex int) error {
 	(*config).mutex.Lock()
 	defer (*config).mutex.Unlock()
+	currStream := (*(*config).managedStreamSlice)[streamIndex]
 
+	appendResult, err := currStream.managedstream.AppendRows(ctx, data)
 	if err != nil {
 		return err
 	}
-  
+
+	*currStream.appendResults = append(*currStream.appendResults, appendResult)
 	return nil
 }
 
@@ -324,11 +392,63 @@ func getInstanceCount() int {
 	return len(configMap)
 }
 
+// Finds the stream index when dynamically scaling
+func getLeastLoadedStream(streamSlice *[]*streamConfig) int {
+	min := len(*(*streamSlice)[0].appendResults)
+	minStreamIndex := 0
+	for streamIndex, stream := range *streamSlice {
+		if len(*stream.appendResults) < min {
+			min = len(*stream.appendResults)
+			minStreamIndex = streamIndex
+		}
+	}
+	return minStreamIndex
+}
+
 // This is a test-only method which takes in a config id and returns the current offset value of the struct corresponding to the id
 func getOffset(id int) int64 {
 	config := configMap[id]
 	streamSlice := *config.managedStreamSlice
 	return streamSlice[0].offsetCounter
+}
+
+// Method to determine threshold
+var setThreshold = func(maxQueueSize int) int {
+	requestCountThreshold := int(math.Floor(queueRequestScalingPercent * float64(maxQueueSize)))
+	if requestCountThreshold < minQueueRequests {
+		requestCountThreshold = minQueueRequests
+	}
+	return requestCountThreshold
+}
+
+// This function check whether there is room for scaling and the scales the number of stream dynamically depending on if it
+// Detects back pressure from the queue
+func createNewStreamDynamicScaling(config **outputConfig) {
+	(*config).mutex.Lock()
+	defer (*config).mutex.Unlock()
+	if len(*(*config).managedStreamSlice) < maxNumStreamsPerInstance {
+		// Gets stream with least values in queue
+		mostEfficient := getLeastLoadedStream((*config).managedStreamSlice)
+		mostEfficientQueueLength := len(*(*(*config).managedStreamSlice)[mostEfficient].appendResults)
+
+		var newResQueue []*managedwriter.AppendResult
+		var newStream = streamConfig{
+			offsetCounter: 0,
+			appendResults: &newResQueue,
+		}
+
+		if mostEfficientQueueLength > (*config).requestCountThreshold {
+			*(*config).managedStreamSlice = append(*(*config).managedStreamSlice, &newStream)
+			newStreamIndex := len(*(*config).managedStreamSlice) - 1
+			err := buildStream(ms_ctx, config, newStreamIndex)
+			if err != nil {
+				log.Printf("Creating an additional managed stream with destination table: %s failed in FLBPluginInit: %s", (*config).tableRef, err)
+				// If failure, failed stream is removed from slice
+				*(*config).managedStreamSlice = (*(*config).managedStreamSlice)[:newStreamIndex]
+			}
+
+		}
+	}
 }
 
 // This interface acts as a wrapper for the *managedwriter.Client type which the realManagedWriterClient struct implements
@@ -376,10 +496,47 @@ var getClient = func(ctx context.Context, projectID string) (ManagedWriterClient
 	return &realManagedWriterClient{currClient: client}, nil
 }
 
+type MWManagedStream interface {
+	AppendRows(ctx context.Context, data [][]byte, opts ...managedwriter.AppendOption) (*managedwriter.AppendResult, error)
+	Close() error
+	Finalize(ctx context.Context, opts ...gax.CallOption) (int64, error)
+	FlushRows(ctx context.Context, offset int64, opts ...gax.CallOption) (int64, error)
+	StreamName() string
+}
+
 // To inject a mock interface, we can override getWriter and getContext
+var getWriter = func(client ManagedWriterClient, ctx context.Context, projectID string, opts ...managedwriter.WriterOption) (MWManagedStream, error) {
+	return client.NewManagedStream(ctx, opts...)
+}
 
 // This function acts as a wrapper for the GetContext function so that we may override it to
 // Mock it whenever needed
+var getFLBPluginContext = func(ctx unsafe.Pointer) int {
+	return output.FLBPluginGetContext(ctx).(int)
+}
+
+// Finalizes and Closes all streams in slice for a given instance
+func finalizeCloseAllStreams(config **outputConfig, id int) bool {
+	(*config).mutex.Lock()
+	defer (*config).mutex.Unlock()
+	errFlag := false
+	streamSlice := (*config).managedStreamSlice
+	for i := 0; i < len(*(*config).managedStreamSlice); i++ {
+		if (*streamSlice)[i].managedstream != nil {
+			if (*config).exactlyOnce {
+				if _, err := (*streamSlice)[i].managedstream.Finalize(ms_ctx); err != nil {
+					log.Printf("Finalizing managed stream for output instance with id %d and stream index %d failed in FLBPluginExit: %s", id, i, err)
+					errFlag = true
+				}
+			}
+			if err := (*streamSlice)[i].managedstream.Close(); err != nil {
+				log.Printf("Closing managed stream for output instance with id %d and stream index %d failed in FLBPluginExitCtx: %s", id, i, err)
+				errFlag = true
+			}
+		}
+	}
+	return errFlag
+}
 
 //export FLBPluginRegister
 func FLBPluginRegister(def unsafe.Pointer) int {
@@ -389,7 +546,10 @@ func FLBPluginRegister(def unsafe.Pointer) int {
 //export FLBPluginInit
 func FLBPluginInit(plugin unsafe.Pointer) int {
 	// Set projectID, datasetID, and tableID from config file params
-  
+	projectID := output.FLBPluginConfigKey(plugin, "ProjectID")
+	datasetID := output.FLBPluginConfigKey(plugin, "DatasetID")
+	tableID := output.FLBPluginConfigKey(plugin, "TableID")
+
 	// Set exactly-once bool from config file param
 	exactlyOnceVal, err := getConfigField(plugin, "Exactly_Once", exactlyOnceDefault)
 	if err != nil {
@@ -422,6 +582,8 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		log.Printf("Invalid Max_Queue_Requests parameter in configuration file: %s", err)
 		return output.FLB_ERROR
 	}
+	// Multiply floats, floor it, then convert it to integer for ease of use in Flush
+	requestCountThreshold := setThreshold(maxQueueSize)
 	maxQueueByteSize, err := getConfigField(plugin, "Max_Queue_Bytes", queueByteDefault)
 	if err != nil {
 		log.Printf("Invalid Max_Queue_Bytes parameter in configuration file: %s", err)
@@ -461,6 +623,34 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		enableRetries = true
 	}
 
+	var res_temp []*managedwriter.AppendResult
+	streamSlice := []*streamConfig{}
+
+	// Creates struct for stream and appends to slice
+	initStream := streamConfig{
+		offsetCounter: 0,
+		appendResults: &res_temp,
+	}
+	streamSlice = append(streamSlice, &initStream)
+
+	// Instantiates output instance
+	config := outputConfig{
+		messageDescriptor:     md,
+		streamType:            currStreamType,
+		tableRef:              tableReference,
+		currProjectID:         projectID,
+		schemaDesc:            descriptor,
+		enableRetry:           enableRetries,
+		maxQueueBytes:         maxQueueByteSize,
+		maxQueueRequests:      maxQueueSize,
+		client:                client,
+		maxChunkSize:          maxChunkSize_init,
+		exactlyOnce:           exactlyOnceVal,
+		numRetries:            numRetriesVal,
+		requestCountThreshold: requestCountThreshold,
+		managedStreamSlice:    &streamSlice,
+	}
+
 	// Create stream using NewManagedStream
 	configPointer := &config
 	err = buildStream(ms_ctx, &configPointer, 0)
@@ -469,17 +659,38 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		return output.FLB_ERROR
 	}
 
+	configMap[configID] = &config
+
+	// Creating FLB context for each output, enables multiinstancing
+	config.mutex.Lock()
+	output.FLBPluginSetContext(plugin, configID)
+	configID = configID + 1
+	config.mutex.Unlock()
+
 	return output.FLB_OK
 }
 
 //export FLBPluginFlush
 func FLBPluginFlush(data unsafe.Pointer, length C.int, tag *C.char) int {
+	log.Print("[multiinstance] Flush called for unknown instance")
 	return output.FLB_OK
 }
 
 //export FLBPluginFlushCtx
 func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int {
+	id := getFLBPluginContext(ctx)
+	// Locate stream in map
+	// Look up through reference
+	config, ok := configMap[id]
+	if !ok {
 		log.Printf("Finding configuration for output instance with id: %d failed in FLBPluginFlushCtx", id)
+		return output.FLB_ERROR
+	}
+
+	// Calls checkResponses for all streams in slice
+	checkAllStreamResponses(ms_ctx, &config.managedStreamSlice, false, &config.mutex, config.exactlyOnce, id)
+	// Checks for need to dynamically scale
+	createNewStreamDynamicScaling(&config)
 
 	// Create Fluent Bit decoder
 	dec := output.NewDecoder(data, int(length))
@@ -487,6 +698,11 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	var currsize int
 	// Keeps track of the number of rows previously sent
 	var rowCounter int64
+
+	// Find stream with least number of awaiting queue responses
+	config.mutex.Lock()
+	leastLoadedStreamIndex := getLeastLoadedStream(config.managedStreamSlice)
+	config.mutex.Unlock()
 
 	// Iterate Records
 	for {
@@ -510,6 +726,10 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 				err := sendRequest(ms_ctx, binaryData, &config, leastLoadedStreamIndex)
 				if err != nil {
 					log.Printf("Appending data for output instance with id: %d failed in FLBPluginFlushCtx: %s", id, err)
+				} else if config.exactlyOnce {
+					config.mutex.Lock()
+					(*config.managedStreamSlice)[leastLoadedStreamIndex].offsetCounter += rowCounter
+					config.mutex.Unlock()
 				}
 
 				rowCounter = 0
@@ -525,31 +745,59 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 		}
 	}
 	// Appending Rows
+	err := sendRequest(ms_ctx, binaryData, &config, leastLoadedStreamIndex)
+	if err != nil {
 		log.Printf("Appending data for output instance with id: %d failed in FLBPluginFlushCtx: %s", id, err)
+	} else if config.exactlyOnce {
+		config.mutex.Lock()
+		(*config.managedStreamSlice)[leastLoadedStreamIndex].offsetCounter += rowCounter
+		config.mutex.Unlock()
+	}
 
 	return output.FLB_OK
 }
 
 //export FLBPluginExit
 func FLBPluginExit() int {
+	log.Print("[multiinstance] Exit called for unknown instance")
+	return output.FLB_OK
 }
 
 //export FLBPluginExitCtx
 func FLBPluginExitCtx(ctx unsafe.Pointer) int {
+	// Get context
+	id := output.FLBPluginGetContext(ctx).(int)
+
+	// Locate stream in map
+	config, ok := configMap[id]
+	if !ok {
 		log.Printf("Finding configuration for output instance with id: %d failed in FLBPluginExitCtx", id)
+		return output.FLB_ERROR
+	}
 
 	// Calls checkResponses, finalizes, and closes each stream
+	// If there is an error it preserves it and then continues to close and finalize all other streams
+	checkAllStreamResponses(ms_ctx, &config.managedStreamSlice, false, &config.mutex, config.exactlyOnce, id)
+	errFlag := finalizeCloseAllStreams(&config, id)
 
 	if config.client != nil {
 		if err := config.client.Close(); err != nil {
 			log.Printf("Closing managed writer client for output instance with id: %d failed in FLBPluginExitCtx: %s", id, err)
+			errFlag = true
 		}
 	}
 
+	if errFlag {
+		return output.FLB_ERROR
+	}
 	return output.FLB_OK
 }
 
 //export FLBPluginUnregister
+func FLBPluginUnregister(def unsafe.Pointer) {
+	log.Print("[multiinstance] Unregister called")
+	output.FLBPluginUnregister(def)
+}
 
 func main() {
 }
