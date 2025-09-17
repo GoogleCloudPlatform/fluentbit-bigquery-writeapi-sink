@@ -10,7 +10,7 @@ require (
 	github.com/agiledragon/gomonkey/v2 v2.13.0
 	github.com/fluent/fluent-bit-go v0.0.0-20230731091245-a7a013e2473c
 	github.com/googleapis/gax-go/v2 v2.15.0
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 	google.golang.org/api v0.247.0
 	google.golang.org/grpc v1.74.2
 	google.golang.org/protobuf v1.36.9
