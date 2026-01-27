@@ -63,6 +63,7 @@ type outputConfig struct {
 	exactlyOnce           bool
 	requestCountThreshold int
 	numRetries            int
+	timestampFields       []string
 }
 
 var (
@@ -81,6 +82,7 @@ const (
 	maxNumStreamsPerInstance   = 10
 	minQueueRequests           = 10
 	dateTimeDefault            = true
+	maxUnixSeconds             = 4102444800 // 2100-01-01 00:00:00 UTC in seconds
 )
 
 // This function mangles the top-level and complex (struct) BigQuery schema to convert NUMERIC, BIGNUMERIC, DATETIME, TIME, and JSON fields to STRING.
@@ -117,9 +119,32 @@ func mangleInputSchema(input *storagepb.TableSchema, dataTimeString bool) *stora
 	return newMsg
 }
 
+// This function extracts TIMESTAMP field names from the BigQuery table schema
+func extractTimestampFields(schema *storagepb.TableSchema, prefix string) []string {
+	var fields []string
+	if schema == nil {
+		return fields
+	}
+	for _, f := range schema.GetFields() {
+		fieldName := f.GetName()
+		if prefix != "" {
+			fieldName = prefix + "." + fieldName
+		}
+		if f.GetType() == storagepb.TableFieldSchema_TIMESTAMP {
+			fields = append(fields, fieldName)
+		}
+		// Recursively extract from nested RECORD fields
+		if len(f.GetFields()) > 0 {
+			nestedFields := extractTimestampFields(&storagepb.TableSchema{Fields: f.GetFields()}, fieldName)
+			fields = append(fields, nestedFields...)
+		}
+	}
+	return fields
+}
+
 // This function handles getting data on the schema of the table data is being written to.
 // The getDescriptors function returns the message descriptor (which describes the schema of the corresponding table) as well as a descriptor proto
-func getDescriptors(curr_ctx context.Context, mw_client ManagedWriterClient, project string, dataset string, table string, dataTimeString bool) (protoreflect.MessageDescriptor, *descriptorpb.DescriptorProto, error) {
+func getDescriptors(curr_ctx context.Context, mw_client ManagedWriterClient, project string, dataset string, table string, dataTimeString bool) (protoreflect.MessageDescriptor, *descriptorpb.DescriptorProto, []string, error) {
 	// Create streamID specific to the project, dataset, and table
 	curr_stream := fmt.Sprintf("projects/%s/datasets/%s/tables/%s/streams/_default", project, dataset, table)
 
@@ -132,29 +157,33 @@ func getDescriptors(curr_ctx context.Context, mw_client ManagedWriterClient, pro
 	// Call getwritestream to get data on the table
 	table_data, err := mw_client.GetWriteStream(curr_ctx, &req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// Get the schema from table data
 	init_table_schema := table_data.GetTableSchema()
+
+	// Extract TIMESTAMP field names before mangling the schema
+	timestampFields := extractTimestampFields(init_table_schema, "")
+
 	table_schema := mangleInputSchema(init_table_schema, dataTimeString)
 	// Storage schema -> proto descriptor
 	descriptor, err := adapt.StorageSchemaToProto2Descriptor(table_schema, "root")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// Proto descriptor -> message descriptor
 	messageDescriptor, ok := descriptor.(protoreflect.MessageDescriptor)
 	if !ok {
-		return nil, nil, errors.New("Message descriptor could not be created from table's proto descriptor")
+		return nil, nil, nil, errors.New("Message descriptor could not be created from table's proto descriptor")
 	}
 
 	// Message descriptor -> descriptor proto
 	dp, err := adapt.NormalizeDescriptor(messageDescriptor)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	return messageDescriptor, dp, nil
+	return messageDescriptor, dp, timestampFields, nil
 }
 
 // This function handles the data transformation from JSON to binary for a single json row.
@@ -186,6 +215,9 @@ func jsonToBinary(message_descriptor protoreflect.MessageDescriptor, jsonRow map
 // From https://github.com/majst01/fluent-bit-go-redis-output.git
 // Function is used to transform fluent-bit record to a JSON map
 func parseMap(mapInterface map[interface{}]interface{}) map[string]interface{} {
+	if mapInterface == nil {
+		return nil
+	}
 	m := make(map[string]interface{})
 	for k, v := range mapInterface {
 		switch t := v.(type) {
@@ -194,11 +226,73 @@ func parseMap(mapInterface map[interface{}]interface{}) map[string]interface{} {
 			m[k.(string)] = string(t)
 		case map[interface{}]interface{}:
 			m[k.(string)] = parseMap(t)
+		case []interface{}:
+			m[k.(string)] = parseSlice(t)
 		default:
 			m[k.(string)] = v
 		}
 	}
 	return m
+}
+
+// Function to handle slices that may contain nested maps
+func parseSlice(sliceInterface []interface{}) []interface{} {
+	if sliceInterface == nil {
+		return nil
+	}
+	result := make([]interface{}, len(sliceInterface))
+	for i, v := range sliceInterface {
+		switch t := v.(type) {
+		case []byte:
+			result[i] = string(t)
+		case map[interface{}]interface{}:
+			result[i] = parseMap(t)
+		case []interface{}:
+			result[i] = parseSlice(t)
+		default:
+			result[i] = v
+		}
+	}
+	return result
+}
+
+// Convert timestamp fields from seconds to microseconds for BigQuery Storage Write API
+// BigQuery TIMESTAMP type expects microseconds since Unix epoch
+func convertTimestampFields(data map[string]interface{}, timestampFields []string) {
+	for _, field := range timestampFields {
+		if val, ok := data[field]; ok {
+			switch v := val.(type) {
+			case int64:
+				// If value looks like seconds (less than year 2100 in seconds), convert to microseconds
+				if v > 0 && v < maxUnixSeconds {
+					data[field] = v * 1000000
+				}
+			case int:
+				if v > 0 && v < maxUnixSeconds {
+					data[field] = int64(v) * 1000000
+				}
+			case uint64:
+				if v > 0 && v < maxUnixSeconds {
+					data[field] = int64(v) * 1000000
+				}
+			case float64:
+				if v > 0 && v < maxUnixSeconds {
+					data[field] = int64(v * 1000000)
+				}
+			case string:
+				// Handle string timestamp (e.g., "1769419316")
+				if v != "" {
+					if floatVal, err := strconv.ParseFloat(v, 64); err == nil {
+						if floatVal > 0 && floatVal < maxUnixSeconds {
+							data[field] = int64(floatVal * 1000000)
+						} else {
+							data[field] = int64(floatVal)
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 var isReady = func(result *managedwriter.AppendResult) bool {
@@ -211,7 +305,19 @@ var isReady = func(result *managedwriter.AppendResult) bool {
 }
 
 var pluginGetResult = func(result *managedwriter.AppendResult, ctx context.Context) (int64, error) {
-	return result.GetResult(ctx)
+	offset, err := result.GetResult(ctx)
+	if err != nil {
+		// Try to get detailed row errors from FullResponse
+		if fullResp, respErr := result.FullResponse(ctx); respErr == nil && fullResp != nil {
+			if rowErrors := fullResp.GetRowErrors(); len(rowErrors) > 0 {
+				for _, rowErr := range rowErrors {
+					log.Printf("Row error at index %d: code=%v, message=%s",
+						rowErr.GetIndex(), rowErr.GetCode(), rowErr.GetMessage())
+				}
+			}
+		}
+	}
+	return offset, err
 }
 
 // This function is used for asynchronous WriteAPI response checking
@@ -514,7 +620,7 @@ var getWriter = func(client ManagedWriterClient, ctx context.Context, projectID 
 // Mock it whenever needed
 var getFLBPluginContext = func(ctx unsafe.Pointer) int {
 	if ctx != nil {
-		return *(*int)(ctx)
+		return output.FLBPluginGetContext(ctx).(int)
 	}
 	return 0
 }
@@ -611,11 +717,12 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	tableReference := fmt.Sprintf("projects/%s/datasets/%s/tables/%s", projectID, datasetID, tableID)
 
 	// Call getDescriptors to get the message descriptor, and descriptor proto
-	md, descriptor, err := getDescriptors(ms_ctx, client, projectID, datasetID, tableID, dateTimeStringType)
+	md, descriptor, timestampFields, err := getDescriptors(ms_ctx, client, projectID, datasetID, tableID, dateTimeStringType)
 	if err != nil {
 		log.Printf("Getting message descriptor and descriptor proto for table: %s failed in FLBPluginInit: %s", tableReference, err)
 		return output.FLB_ERROR
 	}
+	log.Printf("Detected TIMESTAMP fields from schema: %v", timestampFields)
 
 	// Set the stream type based on exactly once parameter
 	var currStreamType managedwriter.StreamType
@@ -653,6 +760,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 		numRetries:            numRetriesVal,
 		requestCountThreshold: requestCountThreshold,
 		managedStreamSlice:    &streamSlice,
+		timestampFields:       timestampFields,
 	}
 
 	// Create stream using NewManagedStream
@@ -717,6 +825,9 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 		}
 
 		rowJSONMap := parseMap(record)
+
+		// Convert timestamp fields from seconds to microseconds for BigQuery Storage Write API
+		convertTimestampFields(rowJSONMap, config.timestampFields)
 
 		// Serialize data
 		// Transform each row of data into binary using the jsonToBinary function and the message descriptor from the getDescriptors function
