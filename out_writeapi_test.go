@@ -425,10 +425,7 @@ func TestFLBPluginFlushCtx(t *testing.T) {
 	orgFunc := getFLBPluginContext
 	getFLBPluginContext = func(ctx unsafe.Pointer) int {
 		checks.calledGetContext++
-		if ctx != nil {
-			return *(*int)(ctx)
-		}
-		return 0
+		return setID
 	}
 	defer func() { getFLBPluginContext = orgFunc }()
 
@@ -793,10 +790,7 @@ func TestFLBPluginFlushCtxExactlyOnce(t *testing.T) {
 	orgFunc := getFLBPluginContext
 	getFLBPluginContext = func(ctx unsafe.Pointer) int {
 		checks.calledGetContext++
-		if ctx != nil {
-			return *(*int)(ctx)
-		}
-		return 0
+		return setID
 	}
 	defer func() { getFLBPluginContext = orgFunc }()
 
@@ -966,10 +960,7 @@ func TestFLBPluginFlushCtxErrorHandling(t *testing.T) {
 	orgFunc := getFLBPluginContext
 	getFLBPluginContext = func(ctx unsafe.Pointer) int {
 		checks.calledGetContext++
-		if ctx != nil {
-			return *(*int)(ctx)
-		}
-		return 0
+		return setID
 	}
 	defer func() { getFLBPluginContext = orgFunc }()
 
