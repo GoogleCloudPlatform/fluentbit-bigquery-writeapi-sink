@@ -8,7 +8,7 @@ require (
 	cloud.google.com/go v0.122.0
 	cloud.google.com/go/bigquery v1.69.0
 	github.com/agiledragon/gomonkey/v2 v2.13.0
-	github.com/fluent/fluent-bit-go v0.0.0-20230731091245-a7a013e2473c
+	github.com/fluent/fluent-bit-go v0.0.0-20260909064720-9895046d00ce
 	github.com/googleapis/gax-go/v2 v2.15.0
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/api v0.256.0
@@ -26,6 +26,7 @@ require (
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/goccy/go-json v0.10.2 // indirect
 	github.com/google/flatbuffers v23.5.26+incompatible // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
